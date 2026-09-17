@@ -14,4 +14,8 @@ fun test(foo: Foo) {
     val ret9 = Direction.values()
     val ret10 = Direction.entries
     val ret11 = Direction.valueOf("SOUTH")
+    val ret12 = "".empty
+    val ret13 = "".fromNumber(42)
+    val ret14 = empty
+    val ret15 = fromNumber(42)
 }

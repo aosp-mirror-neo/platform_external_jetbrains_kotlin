@@ -6,6 +6,7 @@
 
 package org.jetbrains.kotlin.analysis.api.standalone.fir.test.cases.session.builder
 
+import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.psi.JavaPsiFacade
 import com.intellij.psi.PsiClass
 import com.intellij.psi.PsiPrimitiveType
@@ -13,29 +14,33 @@ import com.intellij.psi.PsiTypes
 import com.intellij.psi.impl.source.PsiClassReferenceType
 import com.intellij.psi.search.GlobalSearchScope
 import org.jetbrains.kotlin.analysis.api.KaExperimentalApi
+import org.jetbrains.kotlin.analysis.api.KaImplementationDetail
 import org.jetbrains.kotlin.analysis.api.KaNonPublicApi
+import org.jetbrains.kotlin.analysis.api.KaPlatformInterface
 import org.jetbrains.kotlin.analysis.api.analyze
+import org.jetbrains.kotlin.analysis.api.impl.base.util.LibraryUtils
+import org.jetbrains.kotlin.analysis.api.impl.base.util.requireIsInstance
+import org.jetbrains.kotlin.analysis.api.platform.modification.publishGlobalSourceOutOfBlockModificationEvent
 import org.jetbrains.kotlin.analysis.api.platform.projectStructure.KotlinProjectStructureProvider
 import org.jetbrains.kotlin.analysis.api.projectStructure.KaDanglingFileModule
+import org.jetbrains.kotlin.analysis.api.projectStructure.KaLibraryModule
 import org.jetbrains.kotlin.analysis.api.projectStructure.KaSourceModule
 import org.jetbrains.kotlin.analysis.api.resolution.KaSuccessCallInfo
 import org.jetbrains.kotlin.analysis.api.resolution.successfulFunctionCallOrNull
 import org.jetbrains.kotlin.analysis.api.resolution.symbol
-import org.jetbrains.kotlin.analysis.api.standalone.buildStandaloneAnalysisAPISession
-import org.jetbrains.kotlin.analysis.api.symbols.KaConstructorSymbol
-import org.jetbrains.kotlin.analysis.api.symbols.KaLocalVariableSymbol
-import org.jetbrains.kotlin.analysis.api.symbols.KaNamedFunctionSymbol
-import org.jetbrains.kotlin.analysis.api.types.KaClassType
 import org.jetbrains.kotlin.analysis.api.standalone.StandaloneAnalysisAPISession
+import org.jetbrains.kotlin.analysis.api.standalone.StandaloneWorkaroundApi
 import org.jetbrains.kotlin.analysis.api.standalone.base.projectStructure.StandaloneProjectFactory
+import org.jetbrains.kotlin.analysis.api.standalone.projectStructure.StandaloneLibraryScopeConstructionMode
+import org.jetbrains.kotlin.analysis.api.standalone.buildStandaloneAnalysisAPISession
 import org.jetbrains.kotlin.analysis.api.standalone.fir.test.AbstractStandaloneTest
-import org.jetbrains.kotlin.analysis.api.symbols.KaFunctionSymbol
-import org.jetbrains.kotlin.analysis.api.symbols.KaSymbolOrigin
+import org.jetbrains.kotlin.analysis.api.symbols.*
+import org.jetbrains.kotlin.analysis.api.types.KaClassType
 import org.jetbrains.kotlin.analysis.project.structure.builder.buildKtLibraryModule
 import org.jetbrains.kotlin.analysis.project.structure.builder.buildKtSdkModule
 import org.jetbrains.kotlin.analysis.project.structure.builder.buildKtSourceModule
-import org.jetbrains.kotlin.analysis.utils.errors.requireIsInstance
 import org.jetbrains.kotlin.asJava.toLightClass
+import org.jetbrains.kotlin.codegen.forTestCompile.ForTestCompileRuntime
 import org.jetbrains.kotlin.idea.references.mainReference
 import org.jetbrains.kotlin.light.classes.symbol.withMultiplatformLightClassSupport
 import org.jetbrains.kotlin.name.CallableId
@@ -48,8 +53,10 @@ import org.jetbrains.kotlin.platform.js.JsPlatforms
 import org.jetbrains.kotlin.platform.jvm.JvmPlatforms
 import org.jetbrains.kotlin.psi.*
 import org.jetbrains.kotlin.psi.psiUtil.findDescendantOfType
+import org.jetbrains.kotlin.test.testFramework.runWriteAction
 import org.junit.jupiter.api.Assertions
 import org.junit.jupiter.api.Test
+import java.nio.file.Path
 import java.nio.file.Paths
 import kotlin.test.assertEquals
 
@@ -141,7 +148,7 @@ class StandaloneSessionBuilderTest : AbstractStandaloneTest() {
                 platform = CommonPlatforms.defaultCommonPlatform
                 val stdlib = addModule(
                     buildKtLibraryModule {
-                        addBinaryRoot(Paths.get("dist/common/kotlin-stdlib-common.klib"))
+                        addBinaryRoot(ForTestCompileRuntime.stdlibCommonForTests().toPath())
                         platform = CommonPlatforms.defaultCommonPlatform
                         libraryName = "stdlib"
                     }
@@ -425,6 +432,117 @@ class StandaloneSessionBuilderTest : AbstractStandaloneTest() {
     }
 
     @Test
+    fun testLibraryModuleScopeUsesParentTraversalByDefault() {
+        val compiledJar = compileToJar(testDataPath("otherModuleUsage").resolve("dependent"))
+
+        lateinit var libraryModule: KaLibraryModule
+
+        val session = buildStandaloneAnalysisAPISession(disposable) {
+            buildKtModuleProvider {
+                platform = JvmPlatforms.defaultJvmPlatform
+                libraryModule = addModule(
+                    buildKtLibraryModule {
+                        addBinaryRoot(compiledJar)
+                        platform = JvmPlatforms.defaultJvmPlatform
+                        libraryName = "dependency"
+                    }
+                )
+            }
+        }
+
+        val jarRoot = getJarRootVirtualFile(compiledJar, session)
+        val fileInJar = findFirstFileInJar(jarRoot)
+
+        assertLibraryScopeKindAndContainment(libraryModule, "Parent-traversal library search scope", jarRoot, fileInJar)
+    }
+
+    @Test
+    @OptIn(StandaloneWorkaroundApi::class)
+    fun testLibraryModuleScopeRespectsProviderDefaultAndModuleOverride() {
+        val compiledJar = compileToJar(testDataPath("otherModuleUsage").resolve("dependent"))
+
+        lateinit var inheritedModule: KaLibraryModule
+        lateinit var parentTraversalModule: KaLibraryModule
+        lateinit var trieModule: KaLibraryModule
+        lateinit var enumerationModule: KaLibraryModule
+
+        val session = buildStandaloneAnalysisAPISession(disposable) {
+            buildKtModuleProvider {
+                platform = JvmPlatforms.defaultJvmPlatform
+
+                // A provider-wide default that differs from the global default ([StandaloneLibraryScopeConstructionMode.ParentTraversal]).
+                libraryScopeConstructionMode = StandaloneLibraryScopeConstructionMode.Trie
+
+                // Inherits the provider-wide default.
+                inheritedModule = addModule(
+                    buildKtLibraryModule {
+                        addBinaryRoot(compiledJar)
+                        platform = JvmPlatforms.defaultJvmPlatform
+                        libraryName = "inherited"
+                    }
+                )
+
+                // The following modules each override the provider-wide default with a specific mode.
+                parentTraversalModule = addModule(
+                    buildKtLibraryModule {
+                        addBinaryRoot(compiledJar)
+                        libraryScopeConstructionMode = StandaloneLibraryScopeConstructionMode.ParentTraversal
+                        platform = JvmPlatforms.defaultJvmPlatform
+                        libraryName = "parentTraversalOverride"
+                    }
+                )
+                trieModule = addModule(
+                    buildKtLibraryModule {
+                        addBinaryRoot(compiledJar)
+                        libraryScopeConstructionMode = StandaloneLibraryScopeConstructionMode.Trie
+                        platform = JvmPlatforms.defaultJvmPlatform
+                        libraryName = "trieOverride"
+                    }
+                )
+                enumerationModule = addModule(
+                    buildKtLibraryModule {
+                        addBinaryRoot(compiledJar)
+                        libraryScopeConstructionMode = StandaloneLibraryScopeConstructionMode.Enumeration
+                        platform = JvmPlatforms.defaultJvmPlatform
+                        libraryName = "enumerationOverride"
+                    }
+                )
+            }
+        }
+
+        val jarRoot = getJarRootVirtualFile(compiledJar, session)
+        val fileInJar = findFirstFileInJar(jarRoot)
+
+        assertLibraryScopeKindAndContainment(inheritedModule, "Trie-based library search scope", jarRoot, fileInJar)
+        assertLibraryScopeKindAndContainment(parentTraversalModule, "Parent-traversal library search scope", jarRoot, fileInJar)
+        assertLibraryScopeKindAndContainment(trieModule, "Trie-based library search scope", jarRoot, fileInJar)
+        assertLibraryScopeKindAndContainment(enumerationModule, "Enumeration-based library search scope", jarRoot, fileInJar)
+    }
+
+    private fun getJarRootVirtualFile(jar: Path, session: StandaloneAnalysisAPISession): VirtualFile =
+        StandaloneProjectFactory.getVirtualFilesForLibraryRoots(listOf(jar), session.coreApplicationEnvironment).single()
+
+    @OptIn(KaImplementationDetail::class)
+    private fun findFirstFileInJar(jarRoot: VirtualFile): VirtualFile =
+        LibraryUtils.getAllVirtualFilesFromRoot(jarRoot, includeRoot = false).first()
+
+    @OptIn(KaPlatformInterface::class)
+    private fun assertLibraryScopeKindAndContainment(
+        module: KaLibraryModule,
+        expectedDescriptionPrefix: String,
+        jarRoot: VirtualFile,
+        fileInJar: VirtualFile,
+    ) {
+        val scope = module.baseContentScope
+        Assertions.assertTrue(
+            scope.toString().startsWith(expectedDescriptionPrefix),
+            "Expected a library scope matching \"$expectedDescriptionPrefix\", but got: $scope",
+        )
+        Assertions.assertTrue(scope.contains(jarRoot), "The scope should contain the JAR root: $jarRoot")
+        Assertions.assertTrue(scope.contains(fileInJar), "The scope should contain a file from the JAR: $fileInJar")
+    }
+
+    @Test
     fun testCodeFragment() {
         val root = "codeFragment"
 
@@ -630,6 +748,14 @@ class StandaloneSessionBuilderTest : AbstractStandaloneTest() {
             .findClass("org.test.KotlinClass", GlobalSearchScope.projectScope(project))
 
         require(unavailableKotlinClassFromFacade == null)
+
+        runWriteAction {
+            /**
+             * This modification event is needed to invalidate caches in [org.jetbrains.kotlin.asJava.KotlinAsJavaSupport].
+             * Otherwise, the cached `null` result for the non-KMP call will be returned for [withMultiplatformLightClassSupport].
+             */
+            project.publishGlobalSourceOutOfBlockModificationEvent()
+        }
 
         @OptIn(KaNonPublicApi::class)
         withMultiplatformLightClassSupport(project) {
