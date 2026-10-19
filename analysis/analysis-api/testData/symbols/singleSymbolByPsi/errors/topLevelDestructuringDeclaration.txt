@@ -1,7 +1,9 @@
 KaDestructuringDeclarationSymbol:
   annotations: []
-  compilerVisibility: Local
-  entries: []
+  entries: [
+    KaLocalVariableSymbol(<local>/<error property>)
+    KaLocalVariableSymbol(<local>/<error property>)
+  ]
   isActual: false
   isExpect: false
   isExternal: false
@@ -11,5 +13,5 @@ KaDestructuringDeclarationSymbol:
   visibility: LOCAL
   getContainingFileSymbol: KaFileSymbol(topLevelDestructuringDeclaration.kt)
   getContainingModule: KaSourceModule "Sources of main"
-  deprecationStatus: null
+  deprecation: null
   importableFqName: null
